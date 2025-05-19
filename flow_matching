@@ -1,0 +1,88 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+# 设置随机种子
+torch.manual_seed(42)
+
+# 定义二维向量场网络，输入包括时间t和状态x=(x1,x2)，输出为速度向量u=(u1,u2)
+class VectorField(nn.Module):
+    def __init__(self):
+        super(VectorField, self).__init__()
+        # 简单的多层感知机
+        self.net = nn.Sequential(
+            nn.Linear(2 + 1, 128),  # 输入维度2（x维度）+1（时间t）
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Linear(128, 2)      # 输出维度2（速度场的两个分量）
+        )
+    def forward(self, t, x):
+        # 将时间t扩展成与x相同批大小的张量，并与x拼接
+        t_input = t.unsqueeze(-1) if t.dim() == 1 else t  # 保证t是二维张量 [batch,1]
+        t_input = t_input.expand(x.size(0), 1)
+        inp = torch.cat([t_input, x], dim=1)  # [batch, 3]
+        return self.net(inp)
+
+# 定义参考概率路径的函数：给定目标x1、时间t，从条件分布采样x_t，并计算条件速度场u(t, x_t|x1)
+def sample_conditional_path(x1, t, sigma_min=0.0):
+    """ 
+    根据线性插值路径采样给定时间t下的样本x_t和真实速度u(t, x_t|x1)。 
+    x1: [batch, 2] 目标样本
+    t:  [batch] 时间 (0~1之间)
+    """
+    # 线性插值均值和标准差
+    t = t.view(-1, 1)  # [batch, 1]
+    mu_t = t * x1                             # [batch, 2]
+    sigma_t = (1 - t) + t * sigma_min         # [batch, 1], 广播到2维
+    # 从标准正态采样一个噪声 eps
+    eps = torch.randn_like(x1)
+    # 构造条件路径的样本 x_t = mu_t + sigma_t * eps
+    x_t = mu_t + sigma_t * eps
+    # 计算条件速度场 u(t, x_t | x1)
+    # 按公式 u = (dot(sigma)/sigma) * (x - mu) + dot(mu)
+    # dot(mu_t) = x1 (因为 mu_t = t*x1, 导数为 x1)
+    # dot(sigma_t) = -1 + sigma_min (因为 sigma_t = 1 - (1-sigma_min)*t )
+    dot_mu_t = x1
+    dot_sigma_t = -1.0 + sigma_min
+    # (dot(sigma)/sigma) * (x - mu)
+    term1 = (dot_sigma_t / sigma_t) * (x_t - mu_t)      # [batch, 2]
+    term2 = dot_mu_t                                   # [batch, 2]
+    u_true = term1 + term2
+    return x_t, u_true
+
+# 初始化模型和优化器
+device = torch.device('cpu')
+model = VectorField().to(device)
+optimizer = optim.Adam(model.parameters(), lr=1e-3)
+
+# 模拟目标数据分布采样函数（例如两个高斯团）
+def sample_target_data(batch_size):
+    # 随机选择左或右团
+    comp = torch.randint(0, 2, (batch_size,1))
+    # 左团中心在(-4,0)，右团中心在(+4,0)，标准差1
+    centers = torch.tensor([[-4.0, 0.0],[4.0, 0.0]])
+    center = centers[comp.view(-1)]
+    data = center + torch.randn(batch_size, 2)  # 加随机扰动
+    return data
+
+# 训练循环
+for step in range(10000):
+    model.train()
+    batch_size = 128
+    # 1. 随机采样 t ~ Uniform(0,1)，x1 ~ q1(target data)
+    t = torch.rand(batch_size, device=device)
+    x1 = sample_target_data(batch_size).to(device)
+    # 2. 从条件概率路径采样 x_t 和计算真实速度 u_true
+    x_t, u_true = sample_conditional_path(x1, t, sigma_min=0.0)
+    # 3. 计算模型预测的速度 u_pred = u_theta(t, x_t)
+    u_pred = model(t, x_t)
+    # 4. 计算 MSE 损失
+    loss = ((u_pred - u_true) ** 2).mean()
+    # 5. 优化模型参数
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+    # 打印训练损失
+    if step % 1000 == 0:
+        print(f"Step {step}, loss={loss.item():.4f}")
