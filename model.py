@@ -156,7 +156,7 @@ class UNetModel(nn.Module):
     def __init__(
         self,
         in_channels=3,          # 输入图像的通道数
-        model_channels=128,      # 模型基础通道数
+        model_channels=256,      # 模型基础通道数
         out_channels=3,         # 输出图像的通道数
         num_res_blocks=2,       # 每个分辨率的残差块数量
         attention_resolutions=(8, 16),  # 使用注意力的分辨率（下采样倍数）
