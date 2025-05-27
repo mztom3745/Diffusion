@@ -47,7 +47,7 @@ def get_dataloader(batch_size=256, data_path='/root/autodl-pub/cifar-10'):
         transforms.ToTensor(),
         transforms.Normalize((0.4914, 0.4822, 0.4465), (0.247, 0.243, 0.261))
     ])
-    dataset = datasets.CIFAR10(root=data_path, train=True, download=False, transform=transform)
+    dataset = datasets.CIFAR10(root=data_path, train=True, download=True, transform=transform)
     return DataLoader(dataset, batch_size=batch_size, shuffle=True)
 # ==================== 采样函数 ====================
 
