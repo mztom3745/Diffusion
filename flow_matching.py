@@ -42,12 +42,12 @@ def find_latest_checkpoint(folder,dir="unet_fm_epoch"):
 
 # ==================== 数据与模型设置 ====================
 
-def get_dataloader(batch_size=256):
+def get_dataloader(batch_size=256, data_path='/root/autodl-pub/cifar-10'):
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize((0.4914, 0.4822, 0.4465), (0.247, 0.243, 0.261))
     ])
-    dataset = datasets.CIFAR10(root='./CIFAR10data', train=True, download=True, transform=transform)
+    dataset = datasets.CIFAR10(root=data_path, train=True, download=False, transform=transform)
     return DataLoader(dataset, batch_size=batch_size, shuffle=True)
 # ==================== 采样函数 ====================
 
@@ -115,11 +115,11 @@ def train(model, dataloader, device, save_dir="/content/drive/MyDrive/zsz",
             print(f"Epoch [{epoch}/{num_epochs}], Step [{batch_idx}/{len(dataloader)}], Loss: {loss.item():.4f}")
 
         if epoch % savepoch == 0 or epoch == num_epochs:
-        save_path = os.path.join(save_dir, f"{model_name}_epoch{epoch}.pt")
-        torch.save(model.state_dict(), save_path)
-        print(f"✅ 模型第 {epoch} 轮已保存：{save_path}")
-        sample_and_visualize(model, device, epoch,save_dir=save_dir,model_name=model_name)
-        print(f"✅ 模型第 {epoch} 轮图片已保存：{model_name}_epoch{epoch}.png")
+            save_path = os.path.join(save_dir, f"{model_name}_epoch{epoch}.pt")
+            torch.save(model.state_dict(), save_path)
+            print(f"✅ 模型第 {epoch} 轮已保存：{save_path}")
+            sample_and_visualize(model, device, epoch,save_dir=save_dir,model_name=model_name)
+            print(f"✅ 模型第 {epoch} 轮图片已保存：{model_name}_epoch{epoch}.png")
 
 from torch.optim.lr_scheduler import LambdaLR
 
