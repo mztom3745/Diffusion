@@ -1,4 +1,4 @@
-python train_unet.py \
---save_dir ./checkpoints\
---model_name "unet_fm" \
---batch_size 256
+python train_ot.py \
+--save_dir /root/autodl-tmp \
+--model_name "unet_fm_ot"  \
+--batch_size 512
