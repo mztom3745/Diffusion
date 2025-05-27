@@ -17,12 +17,12 @@ def main():
     model = UNetModel().to(device)
 
     # 查找并加载最新 checkpoint
-    ckpt_path, _ = find_latest_checkpoint(args.folder, args.dir)
+    ckpt_path, epoch = find_latest_checkpoint(args.folder, args.dir)
     print(f"🔍 检查点路径：{ckpt_path}")
     if ckpt_path:
         model.load_state_dict(torch.load(ckpt_path, map_location=device))
         print(f"✅ 加载模型成功：{ckpt_path}")
-        sample_and_visualize(model, device)
+        sample_and_visualize(model, device, epoch=epoch, save_dir=args.folder,model_name="unet_fm",max_step=1000)
     else:
         print("❌ 未找到模型权重文件，请先训练。")
 
