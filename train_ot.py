@@ -1,7 +1,7 @@
 import argparse
 import torch
 from unet_model import UNetModel  # 你自己写的模型
-from flowmatching import get_dataloader, train_ot
+from flow_matching import get_dataloader, train_ot
 
 def main():
     # 参数解析
@@ -10,6 +10,7 @@ def main():
     parser.add_argument("--model_name", type=str, default="unet_fm_ot", help="Model name for checkpointing")
     parser.add_argument("--batch_size", type=int, default=256, help="Batch size for training")
     parser.add_argument("--num_epochs", type=int, default=100, help="Number of training epochs")
+    parser.add_argument("--data_path", type=str, default="/root/autodl-pub/cifar-10", help="Directory to data")
     args = parser.parse_args()
 
     # 设置设备
@@ -29,7 +30,7 @@ def main():
     ).to(device)
 
     # 加载数据
-    dataloader = get_dataloader(batch_size=args.batch_size)
+    dataloader = get_dataloader(batch_size=args.batch_size,data_path=args.data_path)
 
     # 开始训练
     train_ot(
