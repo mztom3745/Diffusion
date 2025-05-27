@@ -49,37 +49,6 @@ def get_dataloader(batch_size=256, data_path='/root/autodl-pub/cifar-10'):
     ])
     dataset = datasets.CIFAR10(root=data_path, train=True, download=True, transform=transform)
     return DataLoader(dataset, batch_size=batch_size, shuffle=True)
-# ==================== 采样函数 ====================
-
-def sample_and_visualize(model, device, epoch, save_dir=None,model_name="unet_fm",max_step=1000):
-    model.eval()
-    with torch.no_grad():
-        def ode_func(t, x):
-            t_embed = torch.full((x.size(0),), int(t.item() * max_step), device=x.device)
-            return model(x, t_embed)
-
-        # 初始随机噪声
-        x0 = torch.randn(16, 3, 32, 32).to(device)
-        # 解ODE，仅返回最终状态
-        t_span = torch.tensor([0.0, 1.0], device=device)
-        traj = odeint(ode_func, x0, t_span, rtol=1e-5, atol=1e-5, method='dopri5')
-        x1 = traj[-1]  # t=1 的图像
-
-        # 按 4x4 展示最终生成图像
-        fig, axes = plt.subplots(4, 4, figsize=(6, 6))
-        for i in range(16):
-            row, col = divmod(i, 4)
-            img = torch.clamp(inverse_normalize(x1[i].cpu()), 0, 1)
-            axes[row, col].imshow(img.permute(1, 2, 0))
-            axes[row, col].axis('off')
-        plt.tight_layout()
-        # ✅ 保存图像
-        if save_dir:
-            os.makedirs(save_dir, exist_ok=True)
-            save_path = os.path.join(save_dir, f"{model_name}_epoch{epoch}.png")
-            plt.savefig(save_path)
-            print(f"📸 采样图已保存到: {save_path}")
-        plt.show()
 
 # ==================== 训练函数 ====================
 
@@ -112,7 +81,8 @@ def train(model, dataloader, device, save_dir="/content/drive/MyDrive/zsz",
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            print(f"Epoch [{epoch}/{num_epochs}], Step [{batch_idx}/{len(dataloader)}], Loss: {loss.item():.4f}")
+            if batch_idx % 100 == 0:
+                print(f"Epoch [{epoch}/{num_epochs}], Step [{batch_idx}/{len(dataloader)}], Loss: {loss.item():.4f}")
 
         if epoch % savepoch == 0 or epoch == num_epochs:
             save_path = os.path.join(save_dir, f"{model_name}_epoch{epoch}.pt")
@@ -120,8 +90,40 @@ def train(model, dataloader, device, save_dir="/content/drive/MyDrive/zsz",
             print(f"✅ 模型第 {epoch} 轮已保存：{save_path}")
             sample_and_visualize(model, device, epoch,save_dir=save_dir,model_name=model_name)
             print(f"✅ 模型第 {epoch} 轮图片已保存：{model_name}_epoch{epoch}.png")
+# ==================== 采样函数 ====================
+
+def sample_and_visualize(model, device, epoch, save_dir=None,model_name="unet_fm",max_step=1000):
+    model.eval()
+    with torch.no_grad():
+        def ode_func(t, x):
+            t_embed = torch.full((x.size(0),), int(t.item() * max_step), device=x.device)
+            return model(x, t_embed)
+
+        # 初始随机噪声
+        x0 = torch.randn(16, 3, 32, 32).to(device)
+        # 解ODE，仅返回最终状态
+        t_span = torch.tensor([0.0, 1.0], device=device)
+        traj = odeint(ode_func, x0, t_span, rtol=1e-5, atol=1e-5, method='dopri5')
+        x1 = traj[-1]  # t=1 的图像
+
+        # 按 4x4 展示最终生成图像
+        fig, axes = plt.subplots(4, 4, figsize=(6, 6))
+        for i in range(16):
+            row, col = divmod(i, 4)
+            img = torch.clamp(inverse_normalize(x1[i].cpu()), 0, 1)
+            axes[row, col].imshow(img.permute(1, 2, 0))
+            axes[row, col].axis('off')
+        plt.tight_layout()
+        # ✅ 保存图像
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
+            save_path = os.path.join(save_dir, f"{model_name}_epoch{epoch}.png")
+            plt.savefig(save_path)
+            print(f"📸 采样图已保存到: {save_path}")
+        plt.show()
 
 from torch.optim.lr_scheduler import LambdaLR
+
 
 # 学习率调度器（Polynomial decay with warmup）
 def get_polynomial_scheduler(optimizer, warmup_steps, total_steps, power=1.0):
@@ -132,13 +134,13 @@ def get_polynomial_scheduler(optimizer, warmup_steps, total_steps, power=1.0):
     return LambdaLR(optimizer, lr_lambda)
 
 # 条件采样路径和真实速度
-def sample_conditional_pt_2(x0, x1, t, sigma=0.05):
+def sample_conditional_pt_2(x0, x1, t, sigma=0.1):
     mu_t = t.view(-1, 1, 1, 1) * x1
     epsilon = torch.randn_like(x0)
     sigma = 1 - (1 - sigma) * t.view(-1, 1, 1, 1)
     return mu_t + sigma * epsilon
 
-def sample_conditional_ut(x0, x1, sigma=0.05):
+def sample_conditional_ut(x0, x1, sigma=0.1):
     return x1 - (1 - sigma) * x0
 
 # 主训练函数
