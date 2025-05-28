@@ -1,246 +1,202 @@
-#时间模块定义
+import torch
+import matplotlib.pyplot as plt
+from torchdiffeq import odeint
+
+import os
+import re
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import math
-from abc import abstractmethod
-import torch.nn.functional as F
-from tqdm import tqdm
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+from torchdiffeq import odeint
+
 import matplotlib.pyplot as plt
 
-def timestep_embedding(timesteps, dim, max_period=10000):
-    """
-    Create sinusoidal timestep embeddings.
-    :param timesteps: a 1-D Tensor of N indices, one per batch element.
-                      These may be fractional.
-    :param dim: the dimension of the output.
-    :param max_period: controls the minimum frequency of the embeddings.
-    :return: an [N x dim] Tensor of positional embeddings.
-    """
-    half = dim // 2
-    freqs = torch.exp(
-        -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
-    ).to(device=timesteps.device)
-    args = timesteps[:, None].float() * freqs[None]
-    embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-    if dim % 2:
-        embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
-    return embedding
+# ==================== 通用函数 ====================
 
-# define TimestepEmbedSequential to support `time_emb` as extra input
-class TimestepBlock(nn.Module):
-    """
-    Any module where forward() takes timestep embeddings as a second argument.
-    """
+def inverse_normalize(tensor):
+    mean = torch.tensor([0.4914, 0.4822, 0.4465]).view(3,1,1).to(tensor.device)
+    std = torch.tensor([0.247, 0.243, 0.261]).view(3,1,1).to(tensor.device)
+    return tensor * std + mean
 
-    @abstractmethod
-    def forward(self, x, emb):
-        """
-        Apply the module to `x` given `emb` timestep embeddings.
-        """
+def sample_conditional_pt(x0, x1, t, sigma=0.1):
+    mu_t = t.view(-1, 1, 1, 1) * x1 + (1 - t.view(-1, 1, 1, 1)) * x0
+    epsilon = torch.randn_like(x0)
+    return mu_t + sigma * epsilon
 
-class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
-    """
-    A sequential module that passes timestep embeddings to the children that
-    support it as an extra input.
-    """
+def find_latest_checkpoint(folder,dir="unet_fm_epoch"):
+    pattern = re.compile(fr"{re.escape(dir)}(\d+)\.pt")
+    max_epoch = -1
+    filename = None
+    for f in os.listdir(folder):
+        match = pattern.match(f)
+        if match:
+            epoch = int(match.group(1))
+            if epoch > max_epoch:
+                max_epoch = epoch
+                filename = f
+    if filename:
+        return os.path.join(folder, filename), max_epoch
+    else:
+        return None, -1
 
-    def forward(self, x, emb):
-        for layer in self:
-            if isinstance(layer, TimestepBlock):
-                x = layer(x, emb)
-            else:
-                x = layer(x)
-        return x
+# ==================== 数据与模型设置 ====================
 
-# use GN for norm layer
-def norm_layer(channels):
-    return nn.GroupNorm(32, channels)
-# Attention block with shortcut
+def get_dataloader(batch_size=256, data_path='/root/autodl-pub/cifar-10'):
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.247, 0.243, 0.261))
+    ])
+    dataset = datasets.CIFAR10(root=data_path, train=True, download=True, transform=transform)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-class AttentionBlock(nn.Module):
-    def __init__(self, channels, num_heads=1):
-        super().__init__()
-        self.num_heads = num_heads
-        assert channels % num_heads == 0
+# ==================== 训练函数 ====================
 
-        self.norm = norm_layer(channels)
-        self.qkv = nn.Conv2d(channels, channels * 3, kernel_size=1, bias=False)
-        self.proj = nn.Conv2d(channels, channels, kernel_size=1)
+def train(model, dataloader, device, save_dir="/content/drive/MyDrive/zsz",
+          max_step=1000,
+          num_epochs=100,savepoch=10, model_name="unet_fm"):
+    ckpt_path, start_epoch = find_latest_checkpoint(save_dir,dir=f"{model_name}_epoch")
+    if ckpt_path:
+        model.load_state_dict(torch.load(ckpt_path, map_location=device))
+        print(f"✅ 加载模型成功：{ckpt_path}")
+    else:
+        print("🚀 未找到训练权重，将从头开始训练")
+        start_epoch = 0
+    optimizer = optim.AdamW(model.parameters(), lr=1e-4)
+    for epoch in range(start_epoch + 1, num_epochs + 1):
+        model.train()
+        for batch_idx, (x1, _) in enumerate(dataloader):
+            x1 = x1.to(device)
+            x0 = torch.randn_like(x1).to(device)
 
-    def forward(self, x):
-        B, C, H, W = x.shape
-        qkv = self.qkv(self.norm(x))
-        q, k, v = qkv.reshape(B*self.num_heads, -1, H*W).chunk(3, dim=1)
-        scale = 1. / math.sqrt(C // self.num_heads)
-        attn = torch.einsum("bct,bcs->bts", q * scale, k * scale)
-        attn = attn.softmax(dim=-1)
-        h = torch.einsum("bts,bcs->bct", attn, v)
-        h = h.reshape(B, -1, H, W)
-        h = self.proj(h)
-        return h + x
+            t_continuous = torch.rand(x1.size(0), device=device)
+            t_discrete = (t_continuous * max_step).long().view(-1)
+            t_expand = t_continuous.view(-1, 1, 1, 1)
 
-# Residual block
-class ResidualBlock(TimestepBlock):
-    def __init__(self, in_channels, out_channels, time_channels, dropout):
-        super().__init__()
-        self.conv1 = nn.Sequential(
-            norm_layer(in_channels),
-            nn.SiLU(),
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
-        )
+            xt = sample_conditional_pt(x0, x1, t_expand)
+            vt = model(xt, t_discrete)
+            ut = x1 - x0
 
-        # pojection for time step embedding
-        self.time_emb = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(time_channels, out_channels)
-        )
+            loss = torch.mean((vt - ut) ** 2)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            if batch_idx % 100 == 0:
+                print(f"Epoch [{epoch}/{num_epochs}], Step [{batch_idx}/{len(dataloader)}], Loss: {loss.item():.4f}")
 
-        self.conv2 = nn.Sequential(
-            norm_layer(out_channels),
-            nn.SiLU(),
-            nn.Dropout(p=dropout),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
-        )
+        if epoch % savepoch == 0 or epoch == num_epochs:
+            save_path = os.path.join(save_dir, f"{model_name}_epoch{epoch}.pt")
+            torch.save(model.state_dict(), save_path)
+            print(f"✅ 模型第 {epoch} 轮已保存：{save_path}")
+            sample_and_visualize(model, device, epoch,save_dir=save_dir,model_name=model_name)
+            print(f"✅ 模型第 {epoch} 轮图片已保存：{model_name}_epoch{epoch}.png")
+# ==================== 采样函数 ====================
 
-        if in_channels != out_channels:
-            self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1)
-        else:
-            self.shortcut = nn.Identity()
+def sample_and_visualize(model, device, epoch, save_dir=None,model_name="unet_fm",max_step=1000):
+    model.eval()
+    with torch.no_grad():
+        def ode_func(t, x):
+            t_embed = torch.full((x.size(0),), int(t.item() * max_step), device=x.device)
+            return model(x, t_embed)
 
+        # 初始随机噪声
+        x0 = torch.randn(16, 3, 32, 32).to(device)
+        # 解ODE，仅返回最终状态
+        t_span = torch.tensor([0.0, 1.0], device=device)
+        traj = odeint(ode_func, x0, t_span, rtol=1e-5, atol=1e-5, method='dopri5')
+        x1 = traj[-1]  # t=1 的图像
 
-    def forward(self, x, t):
-        """
-        `x` has shape `[batch_size, in_dim, height, width]`
-        `t` has shape `[batch_size, time_dim]`
-        """
-        h = self.conv1(x)
-        # Add time step embeddings
-        h += self.time_emb(t)[:, :, None, None]
-        h = self.conv2(h)
-        return h + self.shortcut(x)
+        # 按 4x4 展示最终生成图像
+        fig, axes = plt.subplots(4, 4, figsize=(6, 6))
+        for i in range(16):
+            row, col = divmod(i, 4)
+            img = torch.clamp(inverse_normalize(x1[i].cpu()), 0, 1)
+            axes[row, col].imshow(img.permute(1, 2, 0))
+            axes[row, col].axis('off')
+        plt.tight_layout()
+        # ✅ 保存图像
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
+            save_path = os.path.join(save_dir, f"{model_name}_epoch{epoch}.png")
+            plt.savefig(save_path)
+            print(f"📸 采样图已保存到: {save_path}")
+        plt.show()
 
-# upsample
-class Upsample(nn.Module):
-    def __init__(self, channels, use_conv):
-        super().__init__()
-        self.use_conv = use_conv
-        if use_conv:
-            self.conv = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-
-    def forward(self, x, target_size=None):
-        if target_size is not None:
-            x = F.interpolate(x, size=target_size, mode="nearest")
-        else:
-            x = F.interpolate(x, scale_factor=2, mode="nearest")
-        if self.use_conv:
-            x = self.conv(x)
-        return x
+from torch.optim.lr_scheduler import LambdaLR
 
 
-# downsample
-class Downsample(nn.Module):
-    def __init__(self, channels, use_conv):
-        super().__init__()
-        self.use_conv = use_conv
-        if use_conv:
-            self.op = nn.Conv2d(channels, channels, kernel_size=3, stride=2, padding=1)
-        else:
-            self.op = nn.AvgPool2d(stride=2)
+# 学习率调度器（Polynomial decay with warmup）
+def get_polynomial_scheduler(optimizer, warmup_steps, total_steps, power=1.0):
+    def lr_lambda(current_step):
+        if current_step < warmup_steps:
+            return float(current_step) / float(max(1, warmup_steps))
+        return max(0.0, ((total_steps - current_step) / float(max(1, total_steps - warmup_steps))) ** power)
+    return LambdaLR(optimizer, lr_lambda)
 
-    def forward(self, x):
-        return self.op(x)
+# 条件采样路径和真实速度
+def sample_conditional_pt_2(x0, x1, t, sigma=0.1):
+    mu_t = t.view(-1, 1, 1, 1) * x1
+    epsilon = torch.randn_like(x0)
+    sigma = 1 - (1 - sigma) * t.view(-1, 1, 1, 1)
+    return mu_t + sigma * epsilon
 
-#支持num_class的UNet_Model
-class UNetModel(nn.Module):
-    def __init__(self, 
-    in_channels=3, model_channels=128, out_channels=3,
-    num_res_blocks=2, attention_resolutions=(8, 16), dropout=0,
-    channel_mult=(1, 2, 2, 2), conv_resample=True, num_heads=4,
-    num_classes=None):
-        super().__init__()
-        self.model_channels = model_channels
-        self.num_classes = num_classes
+def sample_conditional_ut(x0, x1, sigma=0.1):
+    return x1 - (1 - sigma) * x0
 
-        # 用 model_channels 为中间维度做 embedding
-        time_embed_dim = model_channels
-        self.time_embed = nn.Sequential(
-            nn.Linear(model_channels, model_channels),
-            nn.SiLU(),
-            nn.Linear(model_channels, model_channels)
-        )
+# 主训练函数
+def train_ot(model, dataloader, device, save_dir="/content/drive/MyDrive/zsz",
+          max_step=1000, num_epochs=100, savepoch=10,model_name="unet_fm_ot",
+          base_lr=5e-4):
 
-        if num_classes is not None:
-            self.label_emb = nn.Embedding(num_classes, model_channels)
-            self.label_proj = nn.Linear(model_channels, model_channels)  # 保证维度一致
+    optimizer = optim.AdamW(model.parameters(), lr=base_lr, betas=(0.9, 0.999), weight_decay=1e-2, eps=1e-8)
+    steps_per_epoch = len(dataloader)
+    total_steps = steps_per_epoch * num_epochs
+    warmup_steps = int(total_steps * 0.1)
+    print(f"Total Steps: {total_steps}, Warmup Steps: {warmup_steps}")
+              
+    ckpt_path, start_epoch = find_latest_checkpoint(save_dir,dir=f"{model_name}_epoch")
+    if ckpt_path:
+        model.load_state_dict(torch.load(ckpt_path, map_location=device))
+        print(f"✅ 加载模型成功：{ckpt_path}")
+    else:
+        print("🚀 未找到训练权重，将从头开始训练")
+        start_epoch = 0
+    # =重新计算追踪全局步数
+    steps_per_epoch = len(dataloader)
+    step = start_epoch * steps_per_epoch
+    scheduler = get_polynomial_scheduler(optimizer, warmup_steps=warmup_steps, total_steps=total_steps, power=1.0)
+    scheduler.last_epoch = step - 1  # 重要！
 
-        self.down_blocks = nn.ModuleList([
-            TimestepEmbedSequential(nn.Conv2d(in_channels, model_channels, 3, padding=1))
-        ])
-        down_block_chans = [model_channels]
-        ch = model_channels
-        ds = 1
+    for epoch in range(start_epoch + 1, num_epochs + 1):
+        model.train()
+        for batch_idx, (x1, _) in enumerate(dataloader):
+            x1 = x1.to(device)
+            x0 = torch.randn_like(x1).to(device)
 
-        for level, mult in enumerate(channel_mult):
-            for _ in range(num_res_blocks):
-                layers = [ResidualBlock(ch, mult * model_channels, model_channels, dropout)]
-                ch = mult * model_channels
-                if ds in attention_resolutions:
-                    layers.append(AttentionBlock(ch, num_heads))
-                self.down_blocks.append(TimestepEmbedSequential(*layers))
-                down_block_chans.append(ch)
-            if level != len(channel_mult) - 1:
-                self.down_blocks.append(TimestepEmbedSequential(Downsample(ch, conv_resample)))
-                down_block_chans.append(ch)
-                ds *= 2
+            t_continuous = torch.rand(x1.size(0), device=device)
+            t_discrete = (t_continuous * max_step).long().view(-1)
+            t_expand = t_continuous.view(-1, 1, 1, 1)
 
-        self.middle_block = TimestepEmbedSequential(
-            ResidualBlock(ch, ch, model_channels, dropout),
-            AttentionBlock(ch, num_heads),
-            ResidualBlock(ch, ch, model_channels, dropout)
-        )
+            xt = sample_conditional_pt_2(x0, x1, t_expand)
+            vt = model(xt, t_discrete)
+            ut = sample_conditional_ut(x0, x1)
 
-        self.up_blocks = nn.ModuleList()
-        for level, mult in list(enumerate(channel_mult))[::-1]:
-            for i in range(num_res_blocks + 1):
-                layers = [
-                    ResidualBlock(ch + down_block_chans.pop(), model_channels * mult, model_channels, dropout)
-                ]
-                ch = model_channels * mult
-                if ds in attention_resolutions:
-                    layers.append(AttentionBlock(ch, num_heads))
-                if level and i == num_res_blocks:
-                    layers.append(Upsample(ch, conv_resample))
-                    ds //= 2
-                self.up_blocks.append(TimestepEmbedSequential(*layers))
+            loss = torch.mean((vt - ut) ** 2)
 
-        self.out = nn.Sequential(
-            norm_layer(ch),
-            nn.SiLU(),
-            nn.Conv2d(model_channels, out_channels, 3, padding=1),
-        )
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+            step += 1
 
-    def forward(self, x, timesteps, cond=None):
-        emb = self.time_embed(timestep_embedding(timesteps, self.model_channels))
+            if batch_idx % 100 == 0:
+                current_lr = scheduler.get_last_lr()[0]
+                print(f"Epoch [{epoch}/{num_epochs}], Step [{batch_idx}/{len(dataloader)}], LR: {current_lr:.6f}, Loss: {loss.item():.4f}")
 
-        if self.num_classes is not None:
-            if cond is None or (cond == -1).all():
-                class_emb = 0
-            else:
-                cond = cond.clone()
-                cond[cond == -1] = 0  # 避免 index error
-                class_emb = self.label_proj(self.label_emb(cond))
-            emb = emb + class_emb
-
-        hs = []
-        h = x
-        for module in self.down_blocks:
-            h = module(h, emb)
-            hs.append(h)
-        h = self.middle_block(h, emb)
-        for module in self.up_blocks:
-            skip = hs.pop()
-            if h.shape[2:] != skip.shape[2:]:
-                h = F.interpolate(h, size=skip.shape[2:], mode='nearest')
-            h = module(torch.cat([h, skip], dim=1), emb)
-        return self.out(h)
+        if epoch % savepoch == 0 or epoch == num_epochs:
+            save_path = os.path.join(save_dir, f"{model_name}_epoch{epoch}.pt")
+            torch.save(model.state_dict(), save_path)
+            print(f"✅ 模型第 {epoch} 轮已保存：{save_path}")
+            sample_and_visualize(model, device, epoch,save_dir=save_dir,model_name=model_name)
+            print(f"✅ 模型第 {epoch} 轮图片已保存：{model_name}_epoch{epoch}.png")
