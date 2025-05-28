@@ -151,142 +151,96 @@ class Downsample(nn.Module):
     def forward(self, x):
         return self.op(x)
 
-# 定义完整的UNet模型，包含注意力机制和时间步嵌入
+#支持num_class的UNet_Model
 class UNetModel(nn.Module):
-    def __init__(
-        self,
-        in_channels=3,          # 输入图像的通道数
-        model_channels=256,      # 模型基础通道数
-        out_channels=3,         # 输出图像的通道数
-        num_res_blocks=2,       # 每个分辨率的残差块数量
-        attention_resolutions=(8, 16),  # 使用注意力的分辨率（下采样倍数）
-        dropout=0,               # Dropout率
-        channel_mult=(1, 2, 2, 2),  # 各层通道数的倍增系数
-        conv_resample=True,     # 使用卷积进行上下采样（否则使用最近邻）
-        num_heads=4             # 注意力头数
-    ):
+    def __init__(self, 
+    in_channels=3, model_channels=256, out_channels=3,
+    num_res_blocks=2, attention_resolutions=(8, 16), dropout=0,
+    channel_mult=(1, 2, 2, 2), conv_resample=True, num_heads=4,
+    num_classes=None):
         super().__init__()
-
-        # 保存参数到类实例
-        self.in_channels = in_channels
         self.model_channels = model_channels
-        self.out_channels = out_channels
-        self.num_res_blocks = num_res_blocks
-        self.attention_resolutions = attention_resolutions
-        self.dropout = dropout
-        self.channel_mult = channel_mult
-        self.conv_resample = conv_resample
-        self.num_heads = num_heads
+        self.num_classes = num_classes
 
-        # 时间嵌入层（将时间步编码为高维向量）
-        time_embed_dim = model_channels * 4  # 时间嵌入维度是模型通道的4倍
+        # 用 model_channels 为中间维度做 embedding
+        time_embed_dim = model_channels
         self.time_embed = nn.Sequential(
-            nn.Linear(model_channels, time_embed_dim),  # 线性投影
-            nn.SiLU(),                                  # 激活函数
-            nn.Linear(time_embed_dim, time_embed_dim),  # 再次投影
+            nn.Linear(model_channels, model_channels),
+            nn.SiLU(),
+            nn.Linear(model_channels, model_channels)
         )
 
-        # 下采样模块构建
+        if num_classes is not None:
+            self.label_emb = nn.Embedding(num_classes, model_channels)
+            self.label_proj = nn.Linear(model_channels, model_channels)  # 保证维度一致
+
         self.down_blocks = nn.ModuleList([
-            # 初始卷积层（输入通道→model_channels）
-            TimestepEmbedSequential(nn.Conv2d(in_channels, model_channels, kernel_size=3, padding=1))
+            TimestepEmbedSequential(nn.Conv2d(in_channels, model_channels, 3, padding=1))
         ])
-        down_block_chans = [model_channels]  # 记录各层输出通道数（用于跳跃连接）
-        ch = model_channels                   # 当前通道数跟踪变量
-        ds = 1                               # 当前下采样倍数（初始分辨率）
+        down_block_chans = [model_channels]
+        ch = model_channels
+        ds = 1
 
-        # 遍历每个分辨率阶段（由channel_mult决定层数）
         for level, mult in enumerate(channel_mult):
-            # 每个分辨率阶段添加num_res_blocks个残差块
             for _ in range(num_res_blocks):
-                layers = [
-                    # 残差块（输入通道ch，输出通道mult*model_channels）
-                    ResidualBlock(ch, mult * model_channels, time_embed_dim, dropout)
-                ]
-                ch = mult * model_channels  # 更新当前通道数
-                # 如果当前分辨率需要注意力机制
+                layers = [ResidualBlock(ch, mult * model_channels, model_channels, dropout)]
+                ch = mult * model_channels
                 if ds in attention_resolutions:
-                    layers.append(AttentionBlock(ch, num_heads=num_heads))
-                # 将层序列加入下采样块
+                    layers.append(AttentionBlock(ch, num_heads))
                 self.down_blocks.append(TimestepEmbedSequential(*layers))
-                down_block_chans.append(ch)  # 记录通道数
-
-            # 如果不是最后一个阶段，添加下采样层
+                down_block_chans.append(ch)
             if level != len(channel_mult) - 1:
                 self.down_blocks.append(TimestepEmbedSequential(Downsample(ch, conv_resample)))
-                down_block_chans.append(ch)  # 下采样不改变通道数
-                ds *= 2  # 下采样倍数翻倍（如从1→2，2→4等）
+                down_block_chans.append(ch)
+                ds *= 2
 
-        # 中间模块（包含残差块→注意力→残差块）
         self.middle_block = TimestepEmbedSequential(
-            ResidualBlock(ch, ch, time_embed_dim, dropout),  # 保持通道数
-            AttentionBlock(ch, num_heads=num_heads),          # 注意力机制
-            ResidualBlock(ch, ch, time_embed_dim, dropout)    # 保持通道数
+            ResidualBlock(ch, ch, model_channels, dropout),
+            AttentionBlock(ch, num_heads),
+            ResidualBlock(ch, ch, model_channels, dropout)
         )
 
-        # 上采样模块构建
-        self.up_blocks = nn.ModuleList([])
-        # 逆序遍历channel_mult（从高层到底层）
+        self.up_blocks = nn.ModuleList()
         for level, mult in list(enumerate(channel_mult))[::-1]:
-            # 每个分辨率阶段处理num_res_blocks+1次（包含跳跃连接）
             for i in range(num_res_blocks + 1):
                 layers = [
-                    # 残差块（输入通道=当前通道+跳跃连接的通道，输出通道=model_channels*mult）
-                    ResidualBlock(
-                        ch + down_block_chans.pop(),  # 拼接当前特征与跳跃连接
-                        model_channels * mult,
-                        time_embed_dim,
-                        dropout
-                    )
+                    ResidualBlock(ch + down_block_chans.pop(), model_channels * mult, model_channels, dropout)
                 ]
-                ch = model_channels * mult  # 更新当前通道
-                # 如果需要在该分辨率添加注意力
+                ch = model_channels * mult
                 if ds in attention_resolutions:
-                    layers.append(AttentionBlock(ch, num_heads=num_heads))
-                # 如果是当前阶段的最后一个块且不是最低分辨率，添加上采样
+                    layers.append(AttentionBlock(ch, num_heads))
                 if level and i == num_res_blocks:
                     layers.append(Upsample(ch, conv_resample))
-                    ds //= 2  # 上采样后分辨率翻倍（如16→8）
+                    ds //= 2
                 self.up_blocks.append(TimestepEmbedSequential(*layers))
 
-        # 输出层（归一化→激活→卷积）
         self.out = nn.Sequential(
-            norm_layer(ch),  # 归一化层（需根据实际情况定义，如nn.GroupNorm）
-            nn.SiLU(),       # 激活函数
-            nn.Conv2d(model_channels, out_channels, kernel_size=3, padding=1),  # 输出卷积
+            norm_layer(ch),
+            nn.SiLU(),
+            nn.Conv2d(model_channels, out_channels, 3, padding=1),
         )
 
-    def forward(self, x, timesteps):
-        """
-        前向传播
-        :param x: 输入张量 [N x C x H x W]
-        :param timesteps: 时间步张量 [N]
-        :return: 输出张量 [N x C x H x W]
-        """
-        hs = []  # 保存各层特征用于跳跃连接
-
-        # 1. 时间步嵌入
+    def forward(self, x, timesteps, cond=None):
         emb = self.time_embed(timestep_embedding(timesteps, self.model_channels))
 
-        # 2. 下采样阶段
-        h = x  # 输入
+        if self.num_classes is not None:
+            if cond is None or (cond == -1).all():
+                class_emb = 0
+            else:
+                cond = cond.clone()
+                cond[cond == -1] = 0  # 避免 index error
+                class_emb = self.label_proj(self.label_emb(cond))
+            emb = emb + class_emb
+
+        hs = []
+        h = x
         for module in self.down_blocks:
-            h = module(h, emb)  # 每个模块处理（传入特征和时间嵌入）
-            hs.append(h)         # 保存特征
-
-        # 3. 中间阶段
+            h = module(h, emb)
+            hs.append(h)
         h = self.middle_block(h, emb)
-
-        # 4. 上采样阶段
         for module in self.up_blocks:
-          skip = hs.pop()
-
-          # 如果 spatial size 不一致，则 resize 当前特征图 h
-          if h.shape[2:] != skip.shape[2:]:
-              h = F.interpolate(h, size=skip.shape[2:], mode='nearest')  # 保证拼接维度一致
-
-          cat_in = torch.cat([h, skip], dim=1)
-          h = module(cat_in, emb)
-
-        # 5. 输出层
+            skip = hs.pop()
+            if h.shape[2:] != skip.shape[2:]:
+                h = F.interpolate(h, size=skip.shape[2:], mode='nearest')
+            h = module(torch.cat([h, skip], dim=1), emb)
         return self.out(h)
